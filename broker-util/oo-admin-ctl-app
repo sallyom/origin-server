@@ -3,7 +3,7 @@
 require 'rubygems'
 require 'getoptlong'
 
-CTL_APP_COMMANDS = "(start|stop|force-stop|restart|status|destroy|force-destroy|remove-gear|remove-cartridge|run-connection-hooks|set-multiplier|update-cluster|add-alias|remove-alias)"
+CTL_APP_COMMANDS = "(remove-marketplace-carts)"
 
 def usage
   puts <<USAGE
@@ -16,39 +16,17 @@ oo-admin-ctl-app: Control user applications
 oo-admin-ctl-app OPTIONS
 
 Options:
--l|--login <login_name>
-    Login with OpenShift access (required)
--a|--app     <application>
-    Application name  (alphanumeric) (required)
--n|--domain <domain>
-    Domain name
 -c|--command <command>
-    #{CTL_APP_COMMANDS} (required)
--b|--bypass
-    Ignore warnings
---gear_uuid
-    Gear uuid to operate on
---cartridge
-    Cartridge to operate on
---alias
-    Alias to operate on
---multiplier
-    Multiplier factor to be set for the cartridge
+--dry_run_remove
+    Print what will be removed but don't remove
 -h|--help
     Show Usage info
 USAGE
 end
 
 opts = GetoptLong.new(
-    ["--login",            "-l", GetoptLong::REQUIRED_ARGUMENT],
-    ["--app",              "-a", GetoptLong::REQUIRED_ARGUMENT],
-    ["--domain",           "-n", GetoptLong::REQUIRED_ARGUMENT],
     ["--command",          "-c", GetoptLong::REQUIRED_ARGUMENT],
-    ["--gear_uuid",              GetoptLong::REQUIRED_ARGUMENT],
-    ["--cartridge",              GetoptLong::REQUIRED_ARGUMENT],
-    ["--alias",                  GetoptLong::REQUIRED_ARGUMENT],
-    ["--multiplier",             GetoptLong::REQUIRED_ARGUMENT],
-    ["--bypass",           "-b", GetoptLong::NO_ARGUMENT],
+    ["--dry_run_remove",         GetoptLong::NO_ARGUMENT],
     ["--help",             "-h", GetoptLong::NO_ARGUMENT]
 )
 
@@ -60,26 +38,13 @@ rescue GetoptLong::Error => e
   exit 255
 end
 
-login    = args["--login"]
-app_name = args["--app"]
-domain   = args["--domain"]
+#app_name = args["--app"]
 command  = args['--command']
-bypass   = args['--bypass']
-gear_uuid = args['--gear_uuid']
-cartridge = args['--cartridge']
-# dup is required here since the alias valiadation in add_alias calls a downcase!
-# the string here seems to be frozen and cannot be modified, hence a dup is passed
-server_alias = args['--alias'].dup if args['--alias']
-multiplier = args['--multiplier']
+dry_run_remove = args['--dry_run_remove']
 
 if args["--help"]
   usage
   exit 0
-end
-
-if login.nil? or app_name.nil? or command.nil?
-  usage
-  exit 255
 end
 
 require "#{ENV['OPENSHIFT_BROKER_DIR'] || '/var/www/openshift/broker'}/config/environment"
@@ -88,215 +53,31 @@ include AdminHelper
 # Disable analytics for admin scripts
 Rails.configuration.analytics[:enabled] = false
 
-user = nil
-login = CloudUser.normalize_login(login)
-begin
-  user = CloudUser.with(consistency: :eventual).find_by(login: login)
-rescue Mongoid::Errors::DocumentNotFound
-end
-unless user
-  puts "User #{login} not found."
-  exit 1
-end
-
-if domain
-  app = Application.find_by(:name => app_name, :domain_namespace => domain, :owner_id => user._id)
-else
-  app = Application.find_by_user(user, app_name)
-end
-
-unless app
-  puts "Application #{app_name} for user #{login} not found."
-  exit 1
-end
-
-def check_user_response
-  begin
-    agree = gets.chomp
-    unless agree.to_s.strip =~ /^(true|t|yes|y|1)$/i
-      puts "\n"
-      exit 217
-    end
-  rescue Interrupt
-    puts "\n"
-    exit 217
-  end
-end
-
-
-begin
-  ci = app.component_instances.find_by(cartridge_name: cartridge)
-rescue Exception => e
-  puts "Cartridge #{cartridge} not found in the application #{app.name}"
-  exit 1
-end if cartridge
-
 reply = ResultIO.new
 begin
-  case command
-  when "start"
-    reply.append app.start(cartridge)
-  when "stop"
-    reply.append app.stop(cartridge)
-  when "force-stop"
-    reply.append app.stop(cartridge, true)
-  when "restart"
-    reply.append app.restart(cartridge)
-  when "status"
-    puts "Application UUID is #{app._id}"
-    app.gears.each do |gear|
-      puts "GEAR UUID is #{gear.uuid}"
-    end
-    app.cartridges.each do |cart|
-      reply.append app.status(cart.name)
-    end
-  when "force-destroy","destroy"
-    unless bypass
-      puts <<-WARNING
-    !!!! WARNING !!!! WARNING !!!! WARNING !!!!
-    You are about to delete the #{app_name} application.
-
-    This is NOT reversible, all remote data for this application will be removed.
-    WARNING
-
-      print "Do you want to delete this application (y/n): "
-      check_user_response
-    end
-
-    if command=="destroy"
-      app.destroy_app
-    elsif command=="force-destroy"
-      puts "Force deleting application #{app.name}..."
-      premium_carts = get_premium_carts
-      gear_count = 0
-      Lock.run_in_app_lock(app) do
-        # delete all gears, then delete app
-        app.group_instances.each do |gi|
-          gi.gears.each do |g|
-            gear_count += 1
-            g.deregister_dns rescue nil
-            g.destroy_gear rescue nil
-            begin
-              UsageRecord.track_usage(user._id, app.name, g._id, UsageRecord::EVENTS[:end], UsageRecord::USAGE_TYPES[:gear_usage], gi.gear_size)
-              addtl_fs_gb = gi.addtl_fs_gb
-              UsageRecord.track_usage(user._id, app.name, g._id, UsageRecord::EVENTS[:end], UsageRecord::USAGE_TYPES[:addtl_fs_gb], nil, addtl_fs_gb) if addtl_fs_gb > 0
-              component_instances = gi.component_instances + g.sparse_carts.map {|s| gi.application.component_instances.find_by(_id: s) }
-              carts = component_instances.map { |ci| ci.cartridge_name }.uniq
-              carts.each do |cart|
-                UsageRecord.track_usage(user._id, app.name, g._id, UsageRecord::EVENTS[:end], UsageRecord::USAGE_TYPES[:premium_cart], nil, nil, cart) if premium_carts.include?(cart)
-              end
-            rescue Exception => e
-              puts e.message
-              puts e.backtrace.inspect
+  Application.each do |app|
+    begin
+      if command == "remove-marketplace-carts"
+        app.component_instances.each do |component_instance|
+          cart = component_instance.cartridge_name
+          #match = /cron/.match(cart)  
+          match = /(84codes_ab-cloudamqp|84codes_ab-elephantsql|flashreport-flashreport|flow_search_corporation-flowthings|iron_io-ironmq|iron_io-ironworker|memcachier-memcachier|mongolab-mongolab|new_relic-newrelic|redis_labs-memcachedcloud|redis_labs-rediscloud|sebula_ltd-searchly|sendgrid-sendgrid|successbricks__inc__dba_cleardb-cleardb|teachmatic_ltd-statica|temporize-temporize)(-|_).*/.match(cart)
+          if match != nil
+            filename = "marketplace_carts_in_#{app.name}.txt"
+            open(filename, 'a') do |f| f << "Marketplace cart: #{cart} \n"
             end
-          end if gi.gears.present?
-        end if app.group_instances.present?
-
-        owner = app.domain.owner
-        Lock.run_in_app_user_lock(owner, app) do
-          owner.consumed_gears -= gear_count
-          owner.save!
-        end
-        app.delete
-      end
-    end
-    reply.resultIO << "Successfully deleted application: #{app.name}" if reply.resultIO.string.empty?
-    Rails.logger.info "Successfully deleted application: #{app.name} with id: #{app._id} on behalf of user: #{login}"
-  when "remove-cartridge"
-    unless cartridge
-      puts "Cartridge is required to remove-dependency"
-      exit 1
-    end
-    app.remove_cartridges([cartridge])
-  when "remove-gear"
-    unless gear_uuid
-      puts "Gear uuid is required to remove-gear"
-      exit 1
-    end
-
-    gear_id = nil
-    app.gears.select {|g| (g._id.to_s == gear_uuid) or (g.uuid == gear_uuid)}.each do |g|
-      if g.sparse_carts and (g.sparse_carts.length > 0)
-        puts "Gear #{gear_uuid} hosts sparse components within its group instance. You cannot remove it."
-        puts "You can either remove the cartridge or delete the application."
-        exit 1
-      else
-        cis = g.component_instances
-        cis.each do |ci|
-          app.group_overrides.each do |ago|
-            unless ago.nil?
-              if !ago.min_gears.nil? && ci.gears.length <= ago.min_gears
-                puts "Gear #{gear_uuid} cannot be removed as the application " +
-                "has already reached the minimum gear limit of #{ago.min_gears}."
-                exit 1
-              end
+            if !dry_run_remove  
+              app.remove_cartridges([cart])
             end
           end
-          if ci.gears.length == 1
-            puts "Gear #{gear_uuid} cannot be removed. You need to remove cartridge #{ci.cartridge_name}."
-            exit 1
-          end
         end
-        gear_id = g._id.to_s
-        break
       end
-    end
-
-    unless gear_id
-      puts "Gear #{gear_uuid} not found in #{app.name}"
+    rescue OpenShift::UserException => e
+      puts e.message
       exit 1
     end
-    app.remove_gear(gear_id)
-  when "run-connection-hooks"
-    app.run_connection_hooks
-  when "set-multiplier"
-    unless cartridge
-      puts "Cartridge is required to set multiplier"
-      exit 1
-    end
-    unless multiplier
-      puts "Multiplier factor is a required argument"
-      exit 1
-    end
-    begin
-      ci = app.component_instances.find_by(cartridge_name: cartridge)
-    rescue Exception => e
-      puts "Cartridge #{cartridge} not found in the application #{app.name}"
-      exit 1
-    end
-    unless ci.is_sparse?
-      puts "Cannot set multiplier factor. Cartridge #{cartridge} needs to be a sparse cart."
-      exit 1
-    end
-    app.update_component_limits(ci, nil, nil, nil, multiplier)
-  when "update-cluster"
-    app.update_cluster
-  when "remove-alias"
-    unless server_alias
-      puts "Alias is required. Use --alias to pass an alias."
-      exit 1
-    end
-    begin
-      app.remove_alias(server_alias)
-    rescue Mongoid::Errors::DocumentNotFound => e
-      raise OpenShift::UserException.new("Alias #{server_alias} not found")
-    end
-  when "add-alias"
-    unless server_alias
-      puts "Alias is required. Use --alias to pass an alias."
-      exit 1
-    end
-    app.add_alias(server_alias)
-  else
-    puts "Command must be one of: #{CTL_APP_COMMANDS}"
-    usage
-    exit 255
   end
-rescue OpenShift::UserException => e
-  puts e.message
-  exit 1
 end
-
 puts "DEBUG OUTPUT:\n#{reply.debugIO.string}\n" unless reply.debugIO.string.empty?
 puts "ERROR OUTPUT:\n#{reply.errorIO.string}\n" unless reply.errorIO.string.empty?
 puts reply.resultIO.string.empty? ? "Success" : reply.resultIO.string
